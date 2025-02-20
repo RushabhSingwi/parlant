@@ -85,3 +85,18 @@ test-complete  *specs='':
 
 @clean:
   find . -type d | grep __pycache__ | xargs rm -rf
+
+@benchmark:
+    python scripts/run_benchmarks.py
+
+@benchmark-compare branch:
+    git stash
+    git checkout {{branch}}
+    just benchmark
+    mv benchmark_results benchmark_results_{{branch}}
+    git checkout -
+    git stash pop
+    just benchmark
+    python scripts/compare_benchmarks.py \
+        benchmark_results \
+        benchmark_results_{{branch}}

@@ -17,7 +17,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
-from typing import Callable, NoReturn
+from typing import Callable, List, NoReturn, Tuple
 
 
 @dataclass(frozen=True)
@@ -28,7 +28,7 @@ class Package:
     cmd_prefix: str
     publish: bool
 
-    def run_cmd(self, cmd: str) -> tuple[int, str]:
+    def run_cmd(self, cmd: str) -> Tuple[int, str]:
         print(f"Running command: {self.cmd_prefix} {cmd}")
         return subprocess.getstatusoutput(f"{self.cmd_prefix} {cmd}")
 
@@ -44,7 +44,7 @@ def get_repo_root() -> Path:
     return Path(output.strip())
 
 
-def get_packages() -> list[Package]:
+def get_packages() -> List[Package]:
     root = get_repo_root()
 
     return [
