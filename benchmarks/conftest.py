@@ -1,7 +1,7 @@
 import pytest
-from parlat.core.common import generate_id
-from parlat.core.loggers import Logger
-from parlat.core.nlp.generation import UsageInfo
+from parlant.core.common import generate_id
+from parlant.core.loggers import Logger
+from parlant.core.nlp.generation import UsageInfo
 
 
 @pytest.fixture
