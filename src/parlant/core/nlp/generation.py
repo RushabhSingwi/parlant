@@ -15,29 +15,16 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from functools import cached_property
-from typing import Any, Generic, Mapping, Optional, TypeVar, cast, get_args
+from typing import Any, Generic, Mapping, TypeVar, cast, get_args
 from typing_extensions import override
 
 from parlant.core.common import DefaultBaseModel
+from parlant.core.engines.alpha.prompt_builder import PromptBuilder
 from parlant.core.loggers import Logger
+from parlant.core.nlp.generation_info import GenerationInfo
 from parlant.core.nlp.tokenization import EstimatingTokenizer
 
 T = TypeVar("T", bound=DefaultBaseModel)
-
-
-@dataclass(frozen=True)
-class UsageInfo:
-    input_tokens: int
-    output_tokens: int
-    extra: Optional[Mapping[str, int]] = None
-
-
-@dataclass(frozen=True)
-class GenerationInfo:
-    schema_name: str
-    model: str
-    duration: float
-    usage: UsageInfo
 
 
 @dataclass(frozen=True)
@@ -56,7 +43,7 @@ class SchematicGenerator(ABC, Generic[T]):
     @abstractmethod
     async def generate(
         self,
-        prompt: str,
+        prompt: str | PromptBuilder,
         hints: Mapping[str, Any] = {},
     ) -> SchematicGenerationResult[T]: ...
 
@@ -87,7 +74,7 @@ class FallbackSchematicGenerator(SchematicGenerator[T]):
     @override
     async def generate(
         self,
-        prompt: str,
+        prompt: str | PromptBuilder,
         hints: Mapping[str, Any] = {},
     ) -> SchematicGenerationResult[T]:
         last_exception: Exception

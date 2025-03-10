@@ -31,7 +31,6 @@ from pathlib import Path
 import sys
 import uvicorn
 
-from parlant.adapters.db.transient import TransientDocumentDatabase
 from parlant.adapters.loggers.websocket import WebSocketLogger
 from parlant.adapters.vector_db.chroma import ChromaDatabase
 from parlant.core.engines.alpha import guideline_proposer
@@ -242,14 +241,13 @@ async def load_modules(
         module = importlib.import_module(module_path)
         imported_modules.append(module)
 
-    for m in imported_modules:
         if configure_module := getattr(module, "configure_module", None):
-            LOGGER.info(f"Configuring module '{m.__name__}'")
+            LOGGER.info(f"Configuring module '{module.__name__}'")
             if new_container := await configure_module(container):
                 container = new_container
 
         if initialize_module := getattr(module, "initialize_module", None):
-            initializers.append((m.__name__, initialize_module))
+            initializers.append((module.__name__, initialize_module))
 
     try:
         yield container, initializers
@@ -342,6 +340,9 @@ async def initialize_container(
     services_db = await EXIT_STACK.enter_async_context(
         JSONFileDocumentDatabase(c[Logger], PARLANT_HOME_DIR / "services.json")
     )
+    fragment_db = await EXIT_STACK.enter_async_context(
+        JSONFileDocumentDatabase(c[Logger], PARLANT_HOME_DIR / "fragments.json")
+    )
 
     try:
         c[AgentStore] = await EXIT_STACK.enter_async_context(AgentDocumentStore(agents_db, migrate))
@@ -352,9 +353,7 @@ async def initialize_container(
         c[CustomerStore] = await EXIT_STACK.enter_async_context(
             CustomerDocumentStore(customers_db, migrate)
         )
-        c[FragmentStore] = await EXIT_STACK.enter_async_context(
-            FragmentDocumentStore(TransientDocumentDatabase())
-        )
+        c[FragmentStore] = await EXIT_STACK.enter_async_context(FragmentDocumentStore(fragment_db))
         c[GuidelineStore] = await EXIT_STACK.enter_async_context(
             GuidelineDocumentStore(guidelines_db, migrate)
         )
@@ -483,7 +482,7 @@ async def load_app(params: CLIParams) -> AsyncIterator[ASGIApplication]:
                 load_modules(base_container, modules),
             )
         else:
-            actual_container = base_container
+            actual_container, module_initializers = base_container, []
             LOGGER.info("No external modules selected")
 
         await initialize_container(

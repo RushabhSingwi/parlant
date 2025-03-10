@@ -38,6 +38,7 @@ from fastapi.responses import JSONResponse
 import httpx
 from lagom import Container
 import uvicorn
+
 from parlant.adapters.db.json_file import JSONFileDocumentDatabase
 from parlant.adapters.nlp.openai_service import GPT_4o
 from parlant.core.agents import Agent, AgentId, AgentStore
@@ -51,17 +52,17 @@ from parlant.core.context_variables import (
     ContextVariableValue,
 )
 from parlant.core.customers import Customer, CustomerId, CustomerStore
+from parlant.core.engines.alpha.prompt_builder import PromptBuilder
 from parlant.core.glossary import GlossaryStore, Term
 from parlant.core.guideline_tool_associations import GuidelineToolAssociationStore
 from parlant.core.guidelines import Guideline, GuidelineStore
 from parlant.core.loggers import LogLevel, Logger
 from parlant.core.nlp.generation import (
     FallbackSchematicGenerator,
-    GenerationInfo,
     SchematicGenerationResult,
     SchematicGenerator,
-    UsageInfo,
 )
+from parlant.core.nlp.generation_info import GenerationInfo, UsageInfo
 from parlant.core.nlp.tokenization import EstimatingTokenizer
 from parlant.core.services.tools.plugins import PluginServer, ToolEntry
 from parlant.core.sessions import (
@@ -448,13 +449,19 @@ class CachedSchematicGenerator(SchematicGenerator[TBaseModel]):
         content = schema_type.model_validate(doc["content"])
         info = deserialize_generation_info(doc["info"])
 
-        return SchematicGenerationResult[TBaseModel](content=content, info=info)
+        return SchematicGenerationResult[TBaseModel](
+            content=content,
+            info=info,
+        )
 
     async def generate(
         self,
-        prompt: str,
+        prompt: str | PromptBuilder,
         hints: Mapping[str, Any] = {},
     ) -> SchematicGenerationResult[TBaseModel]:
+        if isinstance(prompt, PromptBuilder):
+            prompt = prompt.build()
+
         if self.use_cache is False:
             return await self._base_generator.generate(prompt, hints)
 
@@ -508,11 +515,15 @@ async def create_schematic_generation_result_collection(
 
 
 @asynccontextmanager
-async def run_service_server(tools: list[ToolEntry]) -> AsyncIterator[PluginServer]:
+async def run_service_server(
+    tools: list[ToolEntry],
+    plugin_data: Mapping[str, Any] = {},
+) -> AsyncIterator[PluginServer]:
     async with PluginServer(
         tools=tools,
         port=PLUGIN_SERVER_PORT,
         host="127.0.0.1",
+        plugin_data=plugin_data,
     ) as server:
         try:
             yield server

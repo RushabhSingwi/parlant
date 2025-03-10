@@ -205,7 +205,7 @@ class ConditionsEntailmentChecker:
         guideline_to_evaluate: GuidelineContent,
         indexed_comparison_guidelines: dict[int, GuidelineContent],
     ) -> Sequence[ConditionsEntailmentTestSchema]:
-        prompt = await self._format_prompt(
+        prompt = await self._build_prompt(
             agent, guideline_to_evaluate, indexed_comparison_guidelines
         )
 
@@ -225,12 +225,12 @@ Condition Entailment Test Results:
 
         return response.content.condition_entailments
 
-    async def _format_prompt(
+    async def _build_prompt(
         self,
         agent: Agent,
         guideline_to_evaluate: GuidelineContent,
         indexed_comparison_guidelines: dict[int, GuidelineContent],
-    ) -> str:
+    ) -> PromptBuilder:
         builder = PromptBuilder()
         comparison_candidates_text = "\n".join(
             f"""{{"id": {id}, "when": "{g.condition}", "then": "{g.action}"}}"""
@@ -239,7 +239,8 @@ Condition Entailment Test Results:
         guideline_to_evaluate_text = f"""{{"when": "{guideline_to_evaluate.condition}", "then": "{guideline_to_evaluate.action}"}}"""
 
         builder.add_section(
-            f"""
+            name="conditions-entailment-checker-general-instructions",
+            template="""
 In our system, the behavior of a conversational AI agent is guided by "guidelines". The agent makes use of these guidelines whenever it interacts with a customer.
 
 Each guideline is composed of two parts:
@@ -253,7 +254,7 @@ Each guideline is composed of two parts:
 
 
 Your task is to evaluate whether pairs of guidelines have entailing 'when' statements.
-{self.get_task_description()}
+{formatted_task_description}
 
 To find whether two guidelines have entailing 'when's, independently determine whether the first 'when' entails the second, and vice-versa.
 Be forgiving regarding misspellings and grammatical errors.
@@ -431,7 +432,8 @@ Expected Output:
 }}
 ```
 ###
-            """  # noqa
+""",
+            props={"formatted_task_description": self.get_task_description()},
         )
 
         builder.add_agent_identity(agent)
@@ -441,7 +443,9 @@ Expected Output:
         )
         builder.add_glossary(terms)
 
-        builder.add_section(f"""
+        builder.add_section(
+            name="conditions-entailment-checker-guidelines-to-analyze",
+            template="""
 The guidelines you should analyze for entailments are:
 Origin guideline: ###
 {guideline_to_evaluate_text}
@@ -449,8 +453,16 @@ Origin guideline: ###
 
 Comparison candidates: ###
 {comparison_candidates_text}
-###""")
-        return builder.build()
+###""",
+            props={
+                "guideline_to_evaluate_text": guideline_to_evaluate_text,
+                "comparison_candidates_text": comparison_candidates_text,
+                "guideline_to_evaluate": guideline_to_evaluate,
+                "comparison_candidates": indexed_comparison_guidelines,
+            },
+        )
+
+        return builder
 
     @staticmethod
     def get_task_description() -> str:
@@ -477,7 +489,7 @@ class ActionsContradictionChecker:
         guideline_to_evaluate: GuidelineContent,
         indexed_comparison_guidelines: dict[int, GuidelineContent],
     ) -> Sequence[ActionsContradictionTestSchema]:
-        prompt = await self._format_prompt(
+        prompt = await self._build_prompt(
             agent, guideline_to_evaluate, indexed_comparison_guidelines
         )
         response = await self._schematic_generator.generate(
@@ -496,12 +508,12 @@ Action Contradiction Test Results:
 
         return response.content.action_contradictions
 
-    async def _format_prompt(
+    async def _build_prompt(
         self,
         agent: Agent,
         guideline_to_evaluate: GuidelineContent,
         indexed_comparison_guidelines: dict[int, GuidelineContent],
-    ) -> str:
+    ) -> PromptBuilder:
         builder = PromptBuilder()
         comparison_candidates_text = "\n".join(
             f"""{{"id": {id}, "when": "{g.condition}", "then": "{g.action}"}}"""
@@ -510,7 +522,8 @@ Action Contradiction Test Results:
         guideline_to_evaluate_text = f"""{{"when": "{guideline_to_evaluate.condition}", "then": "{guideline_to_evaluate.action}"}}"""
 
         builder.add_section(
-            f"""
+            name="actions-contradiction-checker-general-instructions",
+            template="""
 In our system, the behavior of a conversational AI agent is guided by "guidelines". The agent makes use of these guidelines whenever it interacts with a customer.
 
 Each guideline is composed of two parts:
@@ -523,7 +536,7 @@ Each guideline is composed of two parts:
           Any instruction described here applies only to the agent, and not to the customer.
 
 To ensure consistency, it is crucial to avoid scenarios where multiple guidelines with conflicting 'then' statements are applied.
-{self.get_task_description()}
+{formatted_task_description}
 
 
 Be forgiving regarding misspellings and grammatical errors.
@@ -672,7 +685,8 @@ Expected Output:
 }}
 ```
 
-###"""  # noqa
+###""",
+            props={"formatted_task_description": self.get_task_description()},
         )
         builder.add_agent_identity(agent)
         terms = await self._glossary_store.find_relevant_terms(
@@ -681,7 +695,9 @@ Expected Output:
         )
         builder.add_glossary(terms)
 
-        builder.add_section(f"""
+        builder.add_section(
+            name="actions-contradiction-checker-guidelines-to-analyze",
+            template="""
 The guidelines you should analyze for entailments are:
 Origin guideline: ###
 {guideline_to_evaluate_text}
@@ -689,8 +705,15 @@ Origin guideline: ###
 
 Comparison candidates: ###
 {comparison_candidates_text}
-###""")
-        return builder.build()
+###""",
+            props={
+                "guideline_to_evaluate_text": guideline_to_evaluate_text,
+                "comparison_candidates_text": comparison_candidates_text,
+                "guideline_to_evaluate": guideline_to_evaluate,
+                "comparison_candidates": indexed_comparison_guidelines,
+            },
+        )
+        return builder
 
     @staticmethod
     def get_task_description() -> str:

@@ -21,19 +21,20 @@ import traceback
 from typing import Any, Mapping, NewType, Optional, Sequence
 
 from parlant.core import async_utils
-from parlant.core.shots import Shot, ShotCollection
-from parlant.core.tools import Tool, ToolContext, ToolParameterDescriptor, ToolParameterOptions
 from parlant.core.agents import Agent
 from parlant.core.common import JSONSerializable, generate_id, DefaultBaseModel
 from parlant.core.context_variables import ContextVariable, ContextVariableValue
-from parlant.core.nlp.generation import GenerationInfo, SchematicGenerator
-from parlant.core.services.tools.service_registry import ServiceRegistry
-from parlant.core.sessions import Event, ToolResult
-from parlant.core.glossary import Term
+from parlant.core.emissions import EmittedEvent
 from parlant.core.engines.alpha.guideline_proposition import GuidelineProposition
 from parlant.core.engines.alpha.prompt_builder import PromptBuilder, BuiltInSection, SectionStatus
-from parlant.core.emissions import EmittedEvent
+from parlant.core.glossary import Term
 from parlant.core.loggers import Logger
+from parlant.core.nlp.generation import SchematicGenerator
+from parlant.core.nlp.generation_info import GenerationInfo
+from parlant.core.services.tools.service_registry import ServiceRegistry
+from parlant.core.sessions import Event, ToolResult
+from parlant.core.shots import Shot, ShotCollection
+from parlant.core.tools import Tool, ToolContext, ToolParameterDescriptor, ToolParameterOptions
 from parlant.core.tools import ToolId, ToolService
 
 ToolCallId = NewType("ToolCallId", str)
@@ -41,34 +42,42 @@ ToolResultId = NewType("ToolResultId", str)
 
 
 class ArgumentEvaluation(DefaultBaseModel):
+    parameter_name: str
     acceptable_source_for_this_argument_according_to_its_tool_definition: str
     evaluate_is_it_provided_by_an_acceptable_source: str
     evaluate_was_it_already_provided_and_should_it_be_provided_again: str
     evaluate_is_it_potentially_problematic_to_guess_what_the_value_is_if_it_isnt_provided: str
     is_optional: bool
-    has_default_value_if_not_provided_by_acceptable_source: bool = False
+    has_default_value_if_not_provided_by_acceptable_source: Optional[bool] = None
     is_missing: bool
-    value: Optional[Any]
+    value_as_string: Optional[str] = None
 
 
 class ToolCallEvaluation(DefaultBaseModel):
     applicability_rationale: str
     applicability_score: int
-    argument_evaluations: Optional[dict[str, ArgumentEvaluation]] = None
+    argument_evaluations: Optional[list[ArgumentEvaluation]] = None
     same_call_is_already_staged: bool
     comparison_with_rejected_tools_including_references_to_subtleties: str
     relevant_subtleties: str
     a_rejected_tool_would_have_been_a_better_fit_if_it_werent_already_rejected: bool
     potentially_better_rejected_tool_name: Optional[str] = None
     potentially_better_rejected_tool_rationale: Optional[str] = None
-    the_better_rejected_tool_should_clearly_be_run_in_tandem_with_the_candidate_tool: bool = False
+    the_better_rejected_tool_should_clearly_be_run_in_tandem_with_the_candidate_tool: Optional[
+        bool
+    ] = None
+    # These 3 ARQs are for cases we've observed where many optional arguments are missing
+    # such that the model would be possibly biased to say the tool shouldn't run.
+    are_optional_arguments_missing: bool
+    are_non_optional_arguments_missing: bool
+    allowed_to_run_without_optional_arguments_even_if_they_are_missing: bool
     should_run: bool
 
 
 class ToolCallInferenceSchema(DefaultBaseModel):
     last_customer_message: Optional[str] = None
     most_recent_customer_inquiry_or_need: Optional[str] = None
-    most_recent_customer_inquiry_or_need_was_already_resolved: Optional[bool] = False
+    most_recent_customer_inquiry_or_need_was_already_resolved: Optional[bool] = None
     name: str
     subtleties_to_be_aware_of: str
     tool_calls_for_candidate_tool: list[ToolCallEvaluation]
@@ -237,7 +246,7 @@ class ToolCaller:
         reference_tools: Sequence[tuple[ToolId, Tool]],
         staged_events: Sequence[EmittedEvent],
     ) -> tuple[GenerationInfo, list[ToolCall], list[MissingToolData]]:
-        inference_prompt = self._format_tool_call_inference_prompt(
+        inference_prompt = self._build_tool_call_inference_prompt(
             agent,
             context_variables,
             interaction_history,
@@ -258,14 +267,18 @@ class ToolCaller:
         missing_data = []
 
         for tc in inference_output:
-            if tc.applicability_score >= 6 and (
-                not tc.a_rejected_tool_would_have_been_a_better_fit_if_it_werent_already_rejected
-                or tc.the_better_rejected_tool_should_clearly_be_run_in_tandem_with_the_candidate_tool
+            if (
+                tc.applicability_score >= 6
+                and not tc.same_call_is_already_staged
+                and (
+                    not tc.a_rejected_tool_would_have_been_a_better_fit_if_it_werent_already_rejected
+                    or tc.the_better_rejected_tool_should_clearly_be_run_in_tandem_with_the_candidate_tool
+                )
             ):
                 if tc.should_run and all(
                     not evaluation.is_missing
-                    for argument, evaluation in (tc.argument_evaluations or {}).items()
-                    if argument in candidate_descriptor[1].required
+                    for evaluation in tc.argument_evaluations or []
+                    if evaluation.parameter_name in candidate_descriptor[1].required
                 ):
                     self._logger.debug(
                         f"Inference::Completion::Activated:\n{tc.model_dump_json(indent=2)}"
@@ -276,22 +289,20 @@ class ToolCaller:
                             id=ToolCallId(generate_id()),
                             tool_id=tool_id,
                             arguments={
-                                name: evaluation.value
-                                for name, evaluation in tc.argument_evaluations.items()
-                            }
-                            if tc.argument_evaluations
-                            else {},
+                                evaluation.parameter_name: evaluation.value_as_string
+                                for evaluation in tc.argument_evaluations or []
+                            },
                         )
                     )
                 elif tc.applicability_score >= 8:
-                    for argument, evaluation in (tc.argument_evaluations or {}).items():
-                        if argument not in tool.parameters:
+                    for evaluation in tc.argument_evaluations or []:
+                        if evaluation.parameter_name not in tool.parameters:
                             self._logger.error(
-                                f"Inference::Completion: Argument {argument} not found in tool parameters"
+                                f"Inference::Completion: Argument {evaluation.parameter_name} not found in tool parameters"
                             )
                             continue
 
-                        _, tool_options = tool.parameters[argument]
+                        _, tool_options = tool.parameters[evaluation.parameter_name]
 
                         if (
                             evaluation.is_missing
@@ -300,7 +311,7 @@ class ToolCaller:
                         ):
                             missing_data.append(
                                 MissingToolData(
-                                    parameter=argument,
+                                    parameter=evaluation.parameter_name,
                                     significance=tool_options.significance,
                                 )
                             )
@@ -350,6 +361,19 @@ Please be tolerant of possible typos by the user with regards to these terms,and
     async def shots(self) -> Sequence[ToolCallerInferenceShot]:
         return await shot_collection.list()
 
+    def _format_shots(
+        self,
+        shots: Sequence[ToolCallerInferenceShot],
+    ) -> str:
+        return "\n".join(
+            f"""
+Example #{i}: ###
+{self._format_shot(shot)}
+###
+"""
+            for i, shot in enumerate(shots, start=1)
+        )
+
     def _format_shot(
         self,
         shot: ToolCallerInferenceShot,
@@ -363,7 +387,7 @@ Please be tolerant of possible typos by the user with regards to these terms,and
 {json.dumps(shot.expected_result.model_dump(mode="json", exclude_unset=True), indent=2)}
 ```"""
 
-    def _format_tool_call_inference_prompt(
+    def _build_tool_call_inference_prompt(
         self,
         agent: Agent,
         context_variables: Sequence[tuple[ContextVariable, ContextVariableValue]],
@@ -374,14 +398,14 @@ Please be tolerant of possible typos by the user with regards to these terms,and
         reference_tools: Sequence[tuple[ToolId, Tool]],
         staged_events: Sequence[EmittedEvent],
         shots: Sequence[ToolCallerInferenceShot],
-    ) -> str:
+    ) -> PromptBuilder:
         staged_calls = self._get_staged_calls(staged_events)
 
-        builder = PromptBuilder()
+        builder = PromptBuilder(on_build=lambda prompt: self._logger.debug(f"Prompt:\n{prompt}"))
 
         builder.add_section(
-            """
-
+            name="tool-caller-general-instructions",
+            template="""
 GENERAL INSTRUCTIONS
 -----------------
 You are part of a system of AI agents which interact with a customer on the behalf of a business.
@@ -394,12 +418,13 @@ Consequently, some tool calls may have already been initiated and executed follo
 Any such completed tool call will be detailed later in this prompt along with its result.
 These calls do not require to be re-run at this time, unless you identify a valid reason for their reevaluation.
 
-
-"""
+""",
+            props={},
         )
         builder.add_agent_identity(agent)
         builder.add_section(
-            f"""
+            name="tool-caller-task-description",
+            template="""
 -----------------
 TASK DESCRIPTION
 -----------------
@@ -428,7 +453,7 @@ Produce a valid JSON object according to the following format:
         {{
             "applicability_rationale": "<A FEW WORDS THAT EXPLAIN WHETHER AND HOW THE TOOL NEEDS TO BE CALLED>",
             "applicability_score": <INTEGER FROM 1 TO 10>,
-            "argument_evaluations": <EVALUATIONS FOR THE ARGUMENTS. CAN BE DROPPED IF THE TOOL SHOULD NOT EXECUTE>,
+            "argument_evaluations": [<EVALUATIONS FOR THE ARGUMENTS. CAN BE DROPPED ONLY IF THE TOOL APPLICABILITY IS UNDER 6>],
             "same_call_is_already_staged": <BOOL>,
             "comparison_with_rejected_tools_including_references_to_subtleties": "<A VERY BRIEF OVERVIEW OF HOW THIS CALL FARES AGAINST OTHER TOOLS IN APPLICABILITY>",
             "relevant_subtleties": "<IF SUBTLETIES FOUND, REFER TO THE RELEVANT ONES HERE>",
@@ -436,7 +461,10 @@ Produce a valid JSON object according to the following format:
             "potentially_better_rejected_tool_name": "<IF CANDIDATE TOOL IS A WORSE FIT THAN A REJECTED TOOL, THIS IS THE NAME OF THAT REJECTED TOOL>",
             "potentially_better_rejected_tool_rationale": "<IF CANDIDATE TOOL IS A WORSE FIT THAN A REJECTED TOOL, THIS EXPLAINS WHY>",
             "the_better_rejected_tool_should_clearly_be_run_in_tandem_with_the_candidate_tool": <BOOL>,
-            "should_run": <BOOL>
+            "are_optional_arguments_missing": <BOOL>,
+            "are_non_optional_arguments_missing": <BOOL>,
+            "allowed_to_run_without_optional_arguments_even_if_they_are_missing": <BOOL-ALWAYS TRUE>,
+            "should_run": <BOOL-WHETHER THE TOOL IS APPLICABLE, NOT YET STAGED, AND ALL REQUIRED PARAMS ARE PROVIDED>
         }}
         ...
     ]
@@ -449,47 +477,56 @@ The exact format of your output will be provided to you at the end of this promp
 The following examples show correct outputs for various hypothetical situations.
 Only the responses are provided, without the interaction history or tool descriptions, though these can be inferred from the responses.
 
-"""  # noqa
+""",
+            props={},
         )
         builder.add_section(
-            """
+            name="tool-caller-examples",
+            template="""
 EXAMPLES
 -----------------
-"""
-            + "\n".join(
-                f"""
-Example #{i}: ###
-{self._format_shot(shot)}
-###
-"""
-                for i, shot in enumerate(shots, start=1)
-            )
+{formatted_shots}
+""",
+            props={"formatted_shots": self._format_shots(shots), "shots": shots},
         )
         builder.add_context_variables(context_variables)
         if terms:
             builder.add_section(
                 name=BuiltInSection.GLOSSARY,
-                content=self._get_glossary_text(terms),
+                template=self._get_glossary_text(terms),
+                props={"terms": terms},
                 status=SectionStatus.ACTIVE,
             )
         builder.add_interaction_history(interaction_event_list)
 
         builder.add_section(
-            self._add_guideline_propositions_section(
+            name=BuiltInSection.GUIDELINE_DESCRIPTIONS,
+            template=self._add_guideline_propositions_section(
                 ordinary_guideline_propositions,
                 (batch[0], batch[2]),
             ),
-            name=BuiltInSection.GUIDELINE_DESCRIPTIONS,
+            props={
+                "ordinary_guideline_propositions": ordinary_guideline_propositions,
+                "tool_id_propositions": (batch[0], batch[2]),
+            },
+        )
+        tool_definitions_template, tool_definitions_props = self._add_tool_definitions_section(
+            candidate_tool=(batch[0], batch[1]),
+            reference_tools=reference_tools,
         )
         builder.add_section(
-            self._add_tool_definitions_section(
-                candidate_tool=(batch[0], batch[1]),
-                reference_tools=reference_tools,
-            )
+            name="tool-caller-tool-definitions",
+            template=tool_definitions_template,
+            props={
+                **tool_definitions_props,
+                "candidate_tool": (batch[0], batch[1]),
+                "reference_tools": reference_tools,
+            },
         )
         if staged_calls:
             builder.add_section(
-                f"""
+                name="tool-caller-staged-tool-calls",
+                template="""
 STAGED TOOL CALLS
 -----------------
 The following is a list of tool calls staged after the interaction’s latest state. Use this information to avoid redundant calls and to guide your response.
@@ -500,20 +537,23 @@ You may still choose to re-run the tool call, but only if there is a specific re
 The staged tool calls are:
 {staged_calls}
 ###
-"""
+""",
+                props={"staged_calls": staged_calls},
             )
         else:
             builder.add_section(
-                """
+                name="tool-caller-empty-staged-tool-calls",
+                template="""
 STAGED TOOL CALLS
 -----------------
 There are no staged tool calls at this time.
-###
-"""
+""",
+                props={},
             )
 
         builder.add_section(
-            f"""
+            name="tool-caller-output-format",
+            template="""
 OUTPUT FORMAT
 -----------------
 Given the tool, your output should adhere to the following format:
@@ -522,13 +562,13 @@ Given the tool, your output should adhere to the following format:
     "last_customer_message": "<REPEAT THE LAST USER MESSAGE IN THE INTERACTION>",
     "most_recent_customer_inquiry_or_need": "<customer's inquiry or need>",
     "most_recent_customer_inquiry_or_need_was_already_resolved": <BOOL>,
-    "name": "{batch[0].service_name}:{batch[0].tool_name}",
+    "name": "{service_name}:{tool_name}",
     "subtleties_to_be_aware_of": "<NOTE ANY SIGNIFICANT SUBTLETIES TO BE AWARE OF WHEN RUNNING THIS TOOL IN OUR AGENT'S CONTEXT>",
     "tool_calls_for_candidate_tool": [
         {{
             "applicability_rationale": "<A FEW WORDS THAT EXPLAIN WHETHER, HOW, AND TO WHAT EXTENT THE TOOL NEEDS TO BE CALLED AT THIS POINT>",
             "applicability_score": <INTEGER FROM 1 TO 10>,
-            "argument_evaluations": <EVALUATIONS FOR THE ARGUMENTS. CAN BE OMITTED IF THE TOOL SHOULD NOT EXECUTE>,
+            "argument_evaluations": [<EVALUATIONS FOR THE ARGUMENTS. CAN BE DROPPED ONLY IF THE TOOL APPLICABILITY IS UNDER 6>],
             "same_call_is_already_staged": <BOOL>,
             "comparison_with_rejected_tools_including_references_to_subtleties": "<A VERY BRIEF OVERVIEW OF HOW THIS CALL FARES AGAINST OTHER TOOLS IN APPLICABILITY>",
             "relevant_subtleties": "<IF SUBTLETIES FOUND, REFER TO THE RELEVANT ONES HERE>",
@@ -536,32 +576,43 @@ Given the tool, your output should adhere to the following format:
             "potentially_better_rejected_tool_name": "<IF CANDIDATE TOOL IS A WORSE FIT THAN A REJECTED TOOL, THIS IS THE NAME OF THAT REJECTED TOOL>",
             "potentially_better_rejected_tool_rationale": "<IF CANDIDATE TOOL IS A WORSE FIT THAN A REJECTED TOOL, THIS EXPLAINS WHY>",
             "the_better_rejected_tool_should_clearly_be_run_in_tandem_with_the_candidate_tool": <BOOL>,
-            "should_run": <BOOL>
+            "are_optional_arguments_missing": <BOOL>,
+            "are_non_optional_arguments_missing": <BOOL>,
+            "allowed_to_run_without_optional_arguments_even_if_they_are_missing": <BOOL-ALWAYS TRUE>,
+            "should_run": <BOOL-WHETHER THE TOOL IS APPLICABLE, NOT YET STAGED, AND ALL REQUIRED PARAMS ARE PROVIDED>
         }}
     ]
 }}
 ```
 
 However, note that you may choose to have multiple entries in 'tool_calls_for_candidate_tool' if you wish to call the candidate tool multiple times with different arguments.
-###
-        """
+""",
+            props={
+                "service_name": batch[0].service_name,
+                "tool_name": batch[0].tool_name,
+            },
         )
 
-        prompt = builder.build()
-        return prompt
+        return builder
 
     def _add_tool_definitions_section(
         self,
         candidate_tool: tuple[ToolId, Tool],
         reference_tools: Sequence[tuple[ToolId, Tool]],
-    ) -> str:
+    ) -> tuple[str, dict[str, Any]]:
         def _get_param_spec(spec: tuple[ToolParameterDescriptor, ToolParameterOptions]) -> str:
             descriptor, options = spec
 
-            result: dict[str, Any] = {"type": descriptor["type"]}
+            result: dict[str, Any] = {"schema": {"type": descriptor["type"]}}
 
-            if enum := descriptor.get("enum"):
-                result["enum"] = enum
+            if descriptor["type"] == "array":
+                result["schema"]["items"] = {"type": descriptor["item_type"]}
+
+                if enum := descriptor.get("enum"):
+                    result["schema"]["items"]["enum"] = enum
+            else:
+                if enum := descriptor.get("enum"):
+                    result["schema"]["enum"] = enum
 
             if options.description:
                 result["description"] = options.description
@@ -569,27 +620,29 @@ However, note that you may choose to have multiple entries in 'tool_calls_for_ca
                 result["description"] = description
 
             if examples := descriptor.get("examples"):
-                result["examples"] = examples
+                result["extraction_examples__only_for_reference"] = examples
 
             match options.source:
                 case "any":
-                    result["source"] = "This argument can be extracted in the best way you think"
+                    result["acceptable_source"] = (
+                        "This argument can be extracted in the best way you think"
+                    )
                 case "context":
-                    result["source"] = (
+                    result["acceptable_source"] = (
                         "This argument can be extracted only from the context given in this prompt"
                     )
                 case "customer":
-                    result["source"] = (
-                        "This argument must be EXPLICITLY PROVIDED by the customer, and NEVER automatically inferred"
+                    result["acceptable_source"] = (
+                        "This argument must be provided by the customer, and NEVER automatically guessed by you"
                     )
 
             return json.dumps(result)
 
         def _get_tool_spec(t_id: ToolId, t: Tool) -> dict[str, Any]:
             return {
-                "name": t_id.to_string(),
+                "tool_name": t_id.to_string(),
                 "description": t.description,
-                "optional_parameters": {
+                "optional_arguments": {
                     name: _get_param_spec(spec)
                     for name, spec in t.parameters.items()
                     if name not in t.required
@@ -603,18 +656,23 @@ However, note that you may choose to have multiple entries in 'tool_calls_for_ca
 
         candidate_tool_spec = _get_tool_spec(candidate_tool[0], candidate_tool[1])
         if not reference_tools:
-            return f"""
+            return (
+                """
 The following is the tool function definition.
 IMPORTANT: You must not return results for any tool other than this one, even if you believe they might be relevant:
 ###
 {candidate_tool_spec}
 ###
-"""
+""",
+                {"candidate_tool_spec": candidate_tool_spec},
+            )
+
         else:
             reference_tool_specs = [
                 _get_tool_spec(tool_id, tool) for tool_id, tool in reference_tools
             ]
-            return f"""
+            return (
+                """
 You are provided with multiple tools, categorized as follows:
 - Candidate Tool: The tool under your evaluation.
 - Rejected Tools: A list of additional tools that have been considered already and deemed irrelevant for an unspecified reason
@@ -636,7 +694,12 @@ Rejected tools: ###
 Candidate tool: ###
 {candidate_tool_spec}
 ###
-"""
+""",
+                {
+                    "candidate_tool_spec": candidate_tool_spec,
+                    "reference_tool_specs": reference_tool_specs,
+                },
+            )
 
     def _add_guideline_propositions_section(
         self,
@@ -681,10 +744,8 @@ Guidelines:
 
     async def _run_inference(
         self,
-        prompt: str,
+        prompt: PromptBuilder,
     ) -> tuple[GenerationInfo, Sequence[ToolCallEvaluation]]:
-        self._logger.debug(f"Inference::Prompt:\n{prompt}")
-
         inference = await self._schematic_generator.generate(
             prompt=prompt,
             hints={"temperature": 0.05},
@@ -768,23 +829,27 @@ _baseline_shots: Sequence[ToolCallerInferenceShot] = [
                 ToolCallEvaluation(
                     applicability_rationale="We need the client's current balance to respond to their question",
                     applicability_score=9,
-                    argument_evaluations={
-                        "customer_id": ArgumentEvaluation(
-                            acceptable_source_for_this_argument_according_to_its_tool_definition="context",
+                    argument_evaluations=[
+                        ArgumentEvaluation(
+                            parameter_name="customer_id",
+                            acceptable_source_for_this_argument_according_to_its_tool_definition="<INFER THIS BASED ON TOOL DEFINITION>",
                             evaluate_is_it_provided_by_an_acceptable_source="The customer ID is given by a context variable",
                             evaluate_was_it_already_provided_and_should_it_be_provided_again="No need to provide it again as the customer's ID is unique and doesn't change",
                             evaluate_is_it_potentially_problematic_to_guess_what_the_value_is_if_it_isnt_provided="It would be extremely problematic, but I don't need to guess here since I have it",
                             is_missing=False,
                             is_optional=False,
-                            value="12345",
+                            value_as_string="12345",
                         )
-                    },
+                    ],
                     same_call_is_already_staged=True,
                     comparison_with_rejected_tools_including_references_to_subtleties=(
                         "There are no tools in the list of rejected tools"
                     ),
                     relevant_subtleties="check_balance(12345) is already staged",
                     a_rejected_tool_would_have_been_a_better_fit_if_it_werent_already_rejected=False,
+                    are_optional_arguments_missing=False,
+                    are_non_optional_arguments_missing=False,
+                    allowed_to_run_without_optional_arguments_even_if_they_are_missing=True,
                     should_run=False,
                 )
             ],
@@ -809,6 +874,9 @@ _baseline_shots: Sequence[ToolCallerInferenceShot] = [
                     comparison_with_rejected_tools_including_references_to_subtleties="There are no tools in the list of rejected tools",
                     relevant_subtleties="no subtleties were detected",
                     a_rejected_tool_would_have_been_a_better_fit_if_it_werent_already_rejected=False,
+                    are_optional_arguments_missing=False,
+                    are_non_optional_arguments_missing=False,
+                    allowed_to_run_without_optional_arguments_even_if_they_are_missing=True,
                     should_run=False,
                 )
             ],
@@ -832,32 +900,37 @@ _baseline_shots: Sequence[ToolCallerInferenceShot] = [
                 ToolCallEvaluation(
                     applicability_rationale="We need to know the price of a ride from New York to Newark to respond to the customer",
                     applicability_score=9,
-                    argument_evaluations={
-                        "origin": ArgumentEvaluation(
-                            acceptable_source_for_this_argument_according_to_its_tool_definition="customer",
+                    argument_evaluations=[
+                        ArgumentEvaluation(
+                            parameter_name="origin",
+                            acceptable_source_for_this_argument_according_to_its_tool_definition="<INFER THIS BASED ON TOOL DEFINITION>",
                             evaluate_is_it_provided_by_an_acceptable_source="Yes, the customer mentioned New York as the origin for their ride",
                             evaluate_was_it_already_provided_and_should_it_be_provided_again="The customer already specifically provided it",
                             evaluate_is_it_potentially_problematic_to_guess_what_the_value_is_if_it_isnt_provided="It would be extremely problematic, but I don't need to guess here since the customer provided it",
                             is_missing=False,
                             is_optional=False,
-                            value="New York",
+                            value_as_string="New York",
                         ),
-                        "destination": ArgumentEvaluation(
-                            acceptable_source_for_this_argument_according_to_its_tool_definition="customer",
+                        ArgumentEvaluation(
+                            parameter_name="destination",
+                            acceptable_source_for_this_argument_according_to_its_tool_definition="<INFER THIS BASED ON TOOL DEFINITION>",
                             evaluate_is_it_provided_by_an_acceptable_source="Yes, the customer mentioned Newark as the destination for their ride",
                             evaluate_was_it_already_provided_and_should_it_be_provided_again="The customer already specifically provided it",
                             evaluate_is_it_potentially_problematic_to_guess_what_the_value_is_if_it_isnt_provided="It would be extremely problematic, but I don't need to guess here since the customer provided it",
                             is_missing=False,
                             is_optional=False,
-                            value="Newark",
+                            value_as_string="Newark",
                         ),
-                    },
+                    ],
                     same_call_is_already_staged=False,
                     comparison_with_rejected_tools_including_references_to_subtleties=(
                         "None of the available reference tools are deemed more suitable for the candidate tool’s application"
                     ),
                     relevant_subtleties="no subtleties were detected",
                     a_rejected_tool_would_have_been_a_better_fit_if_it_werent_already_rejected=False,
+                    are_optional_arguments_missing=False,
+                    are_non_optional_arguments_missing=False,
+                    allowed_to_run_without_optional_arguments_even_if_they_are_missing=True,
                     should_run=True,
                 )
             ],
@@ -880,45 +953,53 @@ _baseline_shots: Sequence[ToolCallerInferenceShot] = [
                 ToolCallEvaluation(
                     applicability_rationale="We need to check how many calories are in the margherita pizza",
                     applicability_score=9,
-                    argument_evaluations={
-                        "product_name": ArgumentEvaluation(
-                            acceptable_source_for_this_argument_according_to_its_tool_definition="context",
+                    argument_evaluations=[
+                        ArgumentEvaluation(
+                            parameter_name="product_name",
+                            acceptable_source_for_this_argument_according_to_its_tool_definition="<INFER THIS BASED ON TOOL DEFINITION>",
                             evaluate_is_it_provided_by_an_acceptable_source="The first product the customer specified is a margherita",
                             evaluate_was_it_already_provided_and_should_it_be_provided_again="The customer already specifically provided it",
                             evaluate_is_it_potentially_problematic_to_guess_what_the_value_is_if_it_isnt_provided="It would be absurd to provide unsolicited information on some random product, but I don't need to guess here since the customer provided it",
                             is_missing=False,
                             is_optional=False,
-                            value="Margherita",
+                            value_as_string="Margherita",
                         ),
-                    },
+                    ],
                     same_call_is_already_staged=False,
                     comparison_with_rejected_tools_including_references_to_subtleties=(
                         "None of the available reference tools are deemed more suitable for the candidate tool’s application"
                     ),
                     relevant_subtleties="two products need to be checked for calories - begin with margherita",
                     a_rejected_tool_would_have_been_a_better_fit_if_it_werent_already_rejected=False,
+                    are_optional_arguments_missing=False,
+                    are_non_optional_arguments_missing=False,
+                    allowed_to_run_without_optional_arguments_even_if_they_are_missing=True,
                     should_run=True,
                 ),
                 ToolCallEvaluation(
                     applicability_rationale="We need to check how many calories are in the deep dish pizza",
                     applicability_score=9,
-                    argument_evaluations={
-                        "product_name": ArgumentEvaluation(
-                            acceptable_source_for_this_argument_according_to_its_tool_definition="context",
+                    argument_evaluations=[
+                        ArgumentEvaluation(
+                            parameter_name="product_name",
+                            acceptable_source_for_this_argument_according_to_its_tool_definition="<INFER THIS BASED ON TOOL DEFINITION>",
                             evaluate_is_it_provided_by_an_acceptable_source="The second product the customer specified is the deep dish",
                             evaluate_was_it_already_provided_and_should_it_be_provided_again="The customer already specifically provided it",
                             evaluate_is_it_potentially_problematic_to_guess_what_the_value_is_if_it_isnt_provided="It would be absurd to provide unsolicited information on some random product, but I don't need to guess here since the customer provided it",
                             is_missing=False,
                             is_optional=False,
-                            value="Deep Dish",
+                            value_as_string="Deep Dish",
                         ),
-                    },
+                    ],
                     same_call_is_already_staged=False,
                     comparison_with_rejected_tools_including_references_to_subtleties=(
                         "None of the available reference tools are deemed more suitable for the candidate tool’s application"
                     ),
                     relevant_subtleties="two products need to be checked for calories - now check deep dish",
                     a_rejected_tool_would_have_been_a_better_fit_if_it_werent_already_rejected=False,
+                    are_optional_arguments_missing=False,
+                    are_non_optional_arguments_missing=False,
+                    allowed_to_run_without_optional_arguments_even_if_they_are_missing=True,
                     should_run=True,
                 ),
             ],
@@ -938,17 +1019,18 @@ _baseline_shots: Sequence[ToolCallerInferenceShot] = [
                 ToolCallEvaluation(
                     applicability_rationale="we need to check for the price of a specific motorcycle model",
                     applicability_score=9,
-                    argument_evaluations={
-                        "model": ArgumentEvaluation(
-                            acceptable_source_for_this_argument_according_to_its_tool_definition="context",
+                    argument_evaluations=[
+                        ArgumentEvaluation(
+                            parameter_name="model",
+                            acceptable_source_for_this_argument_according_to_its_tool_definition="<INFER THIS BASED ON TOOL DEFINITION>",
                             evaluate_is_it_provided_by_an_acceptable_source="Yes; the customer asked about a specific model",
                             evaluate_was_it_already_provided_and_should_it_be_provided_again="The customer asked about a specific model",
                             evaluate_is_it_potentially_problematic_to_guess_what_the_value_is_if_it_isnt_provided="It would be absurd to provide unsolicited information on some random model, but I don't need to guess here since the customer provided it",
                             is_missing=False,
                             is_optional=False,
-                            value="Harley-Davidson Street Glide",
+                            value_as_string="Harley-Davidson Street Glide",
                         )
-                    },
+                    ],
                     same_call_is_already_staged=False,
                     comparison_with_rejected_tools_including_references_to_subtleties=(
                         "candidate tool is more specialized for this use case than the rejected tools"
@@ -962,6 +1044,9 @@ _baseline_shots: Sequence[ToolCallerInferenceShot] = [
                         "and not just general vehicles."
                     ),
                     the_better_rejected_tool_should_clearly_be_run_in_tandem_with_the_candidate_tool=False,
+                    are_optional_arguments_missing=False,
+                    are_non_optional_arguments_missing=False,
+                    allowed_to_run_without_optional_arguments_even_if_they_are_missing=True,
                     should_run=True,
                 )
             ],
@@ -981,17 +1066,18 @@ _baseline_shots: Sequence[ToolCallerInferenceShot] = [
                 ToolCallEvaluation(
                     applicability_rationale="we need to check for the price of a specific vehicle - a Harley-Davidson Street Glide",
                     applicability_score=8,
-                    argument_evaluations={
-                        "model": ArgumentEvaluation(
-                            acceptable_source_for_this_argument_according_to_its_tool_definition="context",
+                    argument_evaluations=[
+                        ArgumentEvaluation(
+                            parameter_name="model",
+                            acceptable_source_for_this_argument_according_to_its_tool_definition="<INFER THIS BASED ON TOOL DEFINITION>",
                             evaluate_is_it_provided_by_an_acceptable_source="Yes; the customer asked about a specific model",
                             evaluate_was_it_already_provided_and_should_it_be_provided_again="The customer asked about a specific model",
                             evaluate_is_it_potentially_problematic_to_guess_what_the_value_is_if_it_isnt_provided="It would be absurd to provide unsolicited information on some random model, but I don't need to guess here since the customer provided it",
                             is_missing=False,
                             is_optional=False,
-                            value="Harley-Davidson Street Glide",
+                            value_as_string="Harley-Davidson Street Glide",
                         )
-                    },
+                    ],
                     same_call_is_already_staged=False,
                     comparison_with_rejected_tools_including_references_to_subtleties="not as good a fit as check_motorcycle_price",
                     relevant_subtleties="no subtleties were detected",
@@ -1002,6 +1088,9 @@ _baseline_shots: Sequence[ToolCallerInferenceShot] = [
                         "which is better fitting for this case compared to the more general check_vehicle_price"
                     ),
                     the_better_rejected_tool_should_clearly_be_run_in_tandem_with_the_candidate_tool=False,
+                    are_optional_arguments_missing=False,
+                    are_non_optional_arguments_missing=False,
+                    allowed_to_run_without_optional_arguments_even_if_they_are_missing=True,
                     should_run=False,
                 )
             ],
@@ -1021,17 +1110,18 @@ _baseline_shots: Sequence[ToolCallerInferenceShot] = [
                 ToolCallEvaluation(
                     applicability_rationale="need to check the current temperature in the living room",
                     applicability_score=8,
-                    argument_evaluations={
-                        "location": ArgumentEvaluation(
-                            acceptable_source_for_this_argument_according_to_its_tool_definition="context",
+                    argument_evaluations=[
+                        ArgumentEvaluation(
+                            parameter_name="location",
+                            acceptable_source_for_this_argument_according_to_its_tool_definition="<INFER THIS BASED ON TOOL DEFINITION>",
                             evaluate_is_it_provided_by_an_acceptable_source="Yes; the customer asked about the living room",
                             evaluate_was_it_already_provided_and_should_it_be_provided_again="The customer asked about a specific location",
                             evaluate_is_it_potentially_problematic_to_guess_what_the_value_is_if_it_isnt_provided="It would be absurd to provide unsolicited information on some random room, but I don't need to guess here since the customer provided it",
                             is_missing=False,
                             is_optional=False,
-                            value="living room",
+                            value_as_string="living room",
                         )
-                    },
+                    ],
                     same_call_is_already_staged=False,
                     comparison_with_rejected_tools_including_references_to_subtleties="check_indoor_temperature is a better fit for this usecase, as it's more specific",
                     relevant_subtleties="no subtleties were detected",
@@ -1042,6 +1132,9 @@ _baseline_shots: Sequence[ToolCallerInferenceShot] = [
                         "Here, since the customer inquired about the temperature of a specific room, the check_indoor_temperature is more fitting."
                     ),
                     the_better_rejected_tool_should_clearly_be_run_in_tandem_with_the_candidate_tool=False,
+                    are_optional_arguments_missing=False,
+                    are_non_optional_arguments_missing=False,
+                    allowed_to_run_without_optional_arguments_even_if_they_are_missing=True,
                     should_run=False,
                 )
             ],
@@ -1062,17 +1155,18 @@ _baseline_shots: Sequence[ToolCallerInferenceShot] = [
                 ToolCallEvaluation(
                     applicability_rationale="need to search for a product with specific technical requirements",
                     applicability_score=6,
-                    argument_evaluations={
-                        "query": ArgumentEvaluation(
-                            acceptable_source_for_this_argument_according_to_its_tool_definition="context",
+                    argument_evaluations=[
+                        ArgumentEvaluation(
+                            parameter_name="query",
+                            acceptable_source_for_this_argument_according_to_its_tool_definition="<INFER THIS BASED ON TOOL DEFINITION>",
                             evaluate_is_it_provided_by_an_acceptable_source="Yes; the customer mentioned their specific requirements",
                             evaluate_was_it_already_provided_and_should_it_be_provided_again="The customer mentioned specific requirements, which is enough for me to construct a query",
                             evaluate_is_it_potentially_problematic_to_guess_what_the_value_is_if_it_isnt_provided="It would be absurd to provide unsolicited information on some random product, but I don't need to guess here since the customer provided their requirements",
                             is_missing=False,
                             is_optional=False,
-                            value="gaming laptop, RTX 3080, 16GB RAM",
+                            value_as_string="gaming laptop, RTX 3080, 16GB RAM",
                         )
-                    },
+                    ],
                     same_call_is_already_staged=False,
                     comparison_with_rejected_tools_including_references_to_subtleties="not as good a fit as search_electronics",
                     relevant_subtleties="While laptops are a kind of product, they are specifically a type of electronics product",
@@ -1084,6 +1178,9 @@ _baseline_shots: Sequence[ToolCallerInferenceShot] = [
                         "which will provide more accurate results for electronic products"
                     ),
                     the_better_rejected_tool_should_clearly_be_run_in_tandem_with_the_candidate_tool=False,
+                    are_optional_arguments_missing=False,
+                    are_non_optional_arguments_missing=False,
+                    allowed_to_run_without_optional_arguments_even_if_they_are_missing=True,
                     should_run=False,
                 )
             ],
@@ -1101,21 +1198,25 @@ _baseline_shots: Sequence[ToolCallerInferenceShot] = [
                 ToolCallEvaluation(
                     applicability_rationale="The customer specifically wants to schedule an appointment, and there are no better reference tools",
                     applicability_score=10,
-                    argument_evaluations={
-                        "date": ArgumentEvaluation(
-                            acceptable_source_for_this_argument_according_to_its_tool_definition="customer",
+                    argument_evaluations=[
+                        ArgumentEvaluation(
+                            parameter_name="date",
+                            acceptable_source_for_this_argument_according_to_its_tool_definition="<INFER THIS BASED ON TOOL DEFINITION>",
                             evaluate_is_it_provided_by_an_acceptable_source="No; the customer hasn't provided a date, and I cannot guess it or infer when they'd be available",
                             evaluate_was_it_already_provided_and_should_it_be_provided_again="The customer hasn't specified it yet",
                             evaluate_is_it_potentially_problematic_to_guess_what_the_value_is_if_it_isnt_provided="It is very problematic to just guess when the customer would be available for an appointment",
                             is_missing=True,
                             is_optional=False,
-                            value=None,
+                            value_as_string=None,
                         )
-                    },
+                    ],
                     same_call_is_already_staged=False,
                     relevant_subtleties="This is the right tool to run, but we lack information for the date argument",
                     comparison_with_rejected_tools_including_references_to_subtleties="There are no tools in the list of rejected tools",
                     a_rejected_tool_would_have_been_a_better_fit_if_it_werent_already_rejected=False,
+                    are_optional_arguments_missing=False,
+                    are_non_optional_arguments_missing=False,
+                    allowed_to_run_without_optional_arguments_even_if_they_are_missing=True,
                     should_run=False,
                 )
             ],

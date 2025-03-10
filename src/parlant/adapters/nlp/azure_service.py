@@ -31,6 +31,7 @@ from pydantic import ValidationError
 import tiktoken
 
 from parlant.adapters.nlp.common import normalize_json_output
+from parlant.core.engines.alpha.prompt_builder import PromptBuilder
 from parlant.core.loggers import Logger
 from parlant.core.nlp.policies import policy, retry
 from parlant.core.nlp.tokenization import EstimatingTokenizer
@@ -39,10 +40,9 @@ from parlant.core.nlp.embedding import Embedder, EmbeddingResult
 from parlant.core.nlp.generation import (
     T,
     SchematicGenerator,
-    GenerationInfo,
     SchematicGenerationResult,
-    UsageInfo,
 )
+from parlant.core.nlp.generation_info import GenerationInfo, UsageInfo
 from parlant.core.nlp.moderation import ModerationService, NoModeration
 
 
@@ -102,9 +102,12 @@ class AzureSchematicGenerator(SchematicGenerator[T]):
 
     async def _do_generate(
         self,
-        prompt: str,
+        prompt: str | PromptBuilder,
         hints: Mapping[str, Any] = {},
     ) -> SchematicGenerationResult[T]:
+        if isinstance(prompt, PromptBuilder):
+            prompt = prompt.build()
+
         azure_api_arguments = {k: v for k, v in hints.items() if k in self.supported_azure_params}
 
         if hints.get("strict", False):

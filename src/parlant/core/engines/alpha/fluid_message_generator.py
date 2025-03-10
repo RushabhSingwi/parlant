@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from itertools import chain
 import json
 import traceback
-from typing import Mapping, Optional, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
 from parlant.core.contextual_correlator import ContextualCorrelator
 from parlant.core.agents import Agent
@@ -27,10 +27,11 @@ from parlant.core.engines.alpha.message_event_composer import (
     MessageEventComposer,
     MessageEventComposition,
 )
-from parlant.core.engines.alpha.tool_caller import ToolInsights
-from parlant.core.nlp.generation import GenerationInfo, SchematicGenerator
+from parlant.core.engines.alpha.tool_caller import MissingToolData, ToolInsights
+from parlant.core.nlp.generation import SchematicGenerator
+from parlant.core.nlp.generation_info import GenerationInfo
 from parlant.core.engines.alpha.guideline_proposition import GuidelineProposition
-from parlant.core.engines.alpha.prompt_builder import PromptBuilder, BuiltInSection, SectionStatus
+from parlant.core.engines.alpha.prompt_builder import PromptBuilder, SectionStatus
 from parlant.core.glossary import Term
 from parlant.core.emissions import EmittedEvent, EventEmitter
 from parlant.core.sessions import Event
@@ -49,10 +50,10 @@ class ContextEvaluation(DefaultBaseModel):
     what_i_do_not_have_enough_information_to_help_with_with_based_on_the_provided_information_that_i_have: Optional[
         str
     ] = None
-    was_i_given_specific_information_here_on_how_to_address_some_of_these_specific_needs: bool = (
-        False
-    )
-    should_i_tell_the_customer_i_cannot_help_with_some_of_those_needs: bool = False
+    was_i_given_specific_information_here_on_how_to_address_some_of_these_specific_needs: Optional[
+        bool
+    ] = None
+    should_i_tell_the_customer_i_cannot_help_with_some_of_those_needs: Optional[bool] = None
 
 
 class FactualInformationEvaluation(DefaultBaseModel):
@@ -70,18 +71,18 @@ class OfferedServiceEvaluation(DefaultBaseModel):
 class Revision(DefaultBaseModel):
     revision_number: int
     content: str
-    factual_information_provided: Optional[list[FactualInformationEvaluation]] = []
-    offered_services: Optional[list[OfferedServiceEvaluation]] = []
-    instructions_followed: Optional[list[str]] = []
-    instructions_broken: Optional[list[str]] = []
-    is_repeat_message: Optional[bool] = False
-    followed_all_instructions: Optional[bool] = False
-    instructions_broken_due_to_missing_data: Optional[bool] = False
+    factual_information_provided: Optional[list[FactualInformationEvaluation]] = None
+    offered_services: Optional[list[OfferedServiceEvaluation]] = None
+    instructions_followed: Optional[list[str]] = None
+    instructions_broken: Optional[list[str]] = None
+    is_repeat_message: Optional[bool] = None
+    followed_all_instructions: Optional[bool] = None
+    instructions_broken_due_to_missing_data: Optional[bool] = None
     missing_data_rationale: Optional[str] = None
-    instructions_broken_only_due_to_prioritization: Optional[bool] = False
+    instructions_broken_only_due_to_prioritization: Optional[bool] = None
     prioritization_rationale: Optional[str] = None
-    all_facts_and_services_sourced_from_prompt: Optional[bool] = True
-    further_revisions_required: Optional[bool] = False
+    all_facts_and_services_sourced_from_prompt: Optional[bool] = None
+    further_revisions_required: Optional[bool] = None
 
 
 class InstructionEvaluation(DefaultBaseModel):
@@ -93,11 +94,11 @@ class InstructionEvaluation(DefaultBaseModel):
 
 class FluidMessageSchema(DefaultBaseModel):
     last_message_of_customer: Optional[str]
-    produced_reply: Optional[bool] = True
-    produced_reply_rationale: Optional[str] = ""
+    produced_reply: Optional[bool] = None
+    produced_reply_rationale: Optional[str] = None
     guidelines: list[str]
     context_evaluation: Optional[ContextEvaluation] = None
-    insights: Optional[list[str]] = []
+    insights: Optional[list[str]] = None
     evaluation_for_each_instruction: Optional[list[InstructionEvaluation]] = None
     revisions: list[Revision]
 
@@ -173,7 +174,7 @@ class FluidMessageGenerator(MessageEventComposer):
             self._logger.info("Skipping response; interaction is empty and there are no guidelines")
             return []
 
-        prompt = self._format_prompt(
+        prompt = self._build_prompt(
             agent=agent,
             context_variables=context_variables,
             customer=customer,
@@ -205,8 +206,6 @@ class FluidMessageGenerator(MessageEventComposer):
 
         last_generation_exception: Exception | None = None
 
-        self._logger.debug(f"Prompt:\n{prompt}")
-
         for generation_attempt in range(3):
             try:
                 generation_info, response_message = await self._generate_response_message(
@@ -237,15 +236,18 @@ class FluidMessageGenerator(MessageEventComposer):
         self,
         ordinary: Sequence[GuidelineProposition],
         tool_enabled: Mapping[GuidelineProposition, Sequence[ToolId]],
-    ) -> str:
+    ) -> tuple[str, dict[str, Any]]:
         all_propositions = list(chain(ordinary, tool_enabled))
 
         if not all_propositions:
-            return """
+            return (
+                """
 In formulating your reply, you are normally required to follow a number of behavioral guidelines.
 However, in this case, no special behavioral guidelines were provided. Therefore, when generating revisions,
 you don't need to specifically double-check if you followed or broke any guidelines.
-"""
+""",
+                {},
+            )
         guidelines = []
 
         for i, p in enumerate(all_propositions, start=1):
@@ -256,7 +258,8 @@ you don't need to specifically double-check if you followed or broke any guideli
 
         guideline_list = "\n".join(guidelines)
 
-        return f"""
+        return (
+            """
 When crafting your reply, you must follow the behavioral guidelines provided below, which have been identified as relevant to the current state of the interaction.
 These guidelines were provided by the business you are representing.
 Each guideline includes a priority score to indicate its importance and a rationale for its relevance.
@@ -271,7 +274,18 @@ Do not disregard a guideline because you believe its 'when' condition or rationa
 
 - **Guidelines**:
 {guideline_list}
-"""
+""",
+            {"guideline_list": guideline_list},
+        )
+
+    def _format_shots(self, shots: Sequence[FluidMessageGeneratorShot]) -> str:
+        return "\n".join(
+            f"""
+    Example {i} - {shot.description}: ###
+    {self._format_shot(shot)}
+    ###"""
+            for i, shot in enumerate(shots, 1)
+        )
 
     def _format_shot(
         self,
@@ -283,7 +297,7 @@ Do not disregard a guideline because you believe its 'when' condition or rationa
 {json.dumps(shot.expected_result.model_dump(mode="json", exclude_unset=True), indent=2)}
 ```"""
 
-    def _format_prompt(
+    def _build_prompt(
         self,
         agent: Agent,
         customer: Customer,
@@ -295,11 +309,12 @@ Do not disregard a guideline because you believe its 'when' condition or rationa
         staged_events: Sequence[EmittedEvent],
         tool_insights: ToolInsights,
         shots: Sequence[FluidMessageGeneratorShot],
-    ) -> str:
-        builder = PromptBuilder()
+    ) -> PromptBuilder:
+        builder = PromptBuilder(on_build=lambda prompt: self._logger.debug(f"Prompt:\n{prompt}"))
 
         builder.add_section(
-            """
+            name="fluid-message-generator-general-instructions",
+            template="""
 GENERAL INSTRUCTIONS
 -----------------
 You are an AI agent who is part of a system that interacts with a customer, also referred to as 'the user'. The current state of this interaction will be provided to you later in this message.
@@ -307,12 +322,14 @@ You role is to generate a reply message to the current (latest) state of the int
 
 Later in this prompt, you'll be provided with behavioral guidelines and other contextual information you must take into account when generating your response.
 
-"""
+""",
+            props={},
         )
 
         builder.add_agent_identity(agent)
         builder.add_section(
-            """
+            name="fluid-message-generator-task-description",
+            template="""
 TASK DESCRIPTION:
 -----------------
 Continue the provided interaction in a natural and human-like manner.
@@ -325,13 +342,15 @@ Always abide by the following general principles (note these are not the "guidel
 5. REITERATE INFORMATION FROM PREVIOUS MESSAGES IF NECESSARY: If you previously suggested a solution, a recommendation, or any other information, you may repeat it when relevant. Your earlier response may have been based on information that is no longer available to you, so it’s important to trust that it was informed by the context at the time.
 6. MAINTAIN GENERATION SECRECY: Never reveal details about the process you followed to produce your response. Do not explicitly mention the tools, context variables, guidelines, glossary, or any other internal information. Present your replies as though all relevant knowledge is inherent to you, not derived from external instructions.
 7. OUTPUT FORMAT: In your generated reply to the customer, use markdown format when applicable.
-"""
+""",
+            props={},
         )
         if not interaction_history or all(
             [event.kind != "message" for event in interaction_history]
         ):
             builder.add_section(
-                """
+                name="fluid-message-generator-initial-message-instructions",
+                template="""
 The interaction with the customer has just began, and no messages were sent by either party.
 If told so by a guideline or some other contextual condition, send the first message. Otherwise, do not produce a reply.
 If you decide not to emit a message, output the following:
@@ -345,18 +364,24 @@ If you decide not to emit a message, output the following:
     "revisions": []
 }}
 Otherwise, follow the rest of this prompt to choose the content of your response.
-        """
+        """,
+                props={},
             )
 
         else:
-            builder.add_section("""
+            builder.add_section(
+                name="fluid-message-generator-ongoing-interaction-instructions",
+                template="""
 Since the interaction with the customer is already ongoing, always produce a reply to the customer's last message.
 The only exception where you may not produce a reply is if the customer explicitly asked you not to respond to their message.
 In all other cases, even if the customer is indicating that the conversation is over, you must produce a reply.
-                """)
+                """,
+                props={},
+            )
 
         builder.add_section(
-            f"""
+            name="fluid-message-generator-revision-mechanism",
+            template="""
 REVISION MECHANISM
 -----------------
 To generate an optimal response that aligns with all guidelines and the current interaction state, follow this structured revision process:
@@ -422,37 +447,40 @@ For instance, if a guideline explicitly prohibits a specific action (e.g., "neve
 
 In cases of conflict, prioritize the business's values and ensure your decisions align with their overarching goals.
 
-"""  # noqa
+""",  # noqa
         )
         builder.add_section(
-            """
+            name="fluid-message-generator-examples",
+            template="""
 EXAMPLES
 -----------------
-"""
-            + "\n".join(
-                f"""
-Example {i} - {shot.description}: ###
-{self._format_shot(shot)}
-###
-
-"""
-                for i, shot in enumerate(shots, start=1)
-            )
+{formatted_shots}
+""",
+            props={
+                "formatted_shots": self._format_shots(shots),
+                "shots": shots,
+            },
         )
         builder.add_section(
-            """
+            name="fluid-message-generator-interaction-context",
+            template="""
 INTERACTION CONTEXT
 -----------------
-"""
+""",
+            props={},
         )
         builder.add_context_variables(context_variables)
         builder.add_glossary(terms)
         builder.add_section(
-            self.get_guideline_propositions_text(
+            name="fluid-message-generator-guideline-descriptions",
+            template=self.get_guideline_propositions_text(
                 ordinary_guideline_propositions,
                 tool_enabled_guideline_propositions,
-            ),
-            name=BuiltInSection.GUIDELINE_DESCRIPTIONS,
+            )[0],
+            props=self.get_guideline_propositions_text(
+                ordinary_guideline_propositions,
+                tool_enabled_guideline_propositions,
+            )[1],
             status=SectionStatus.ACTIVE
             if ordinary_guideline_propositions or tool_enabled_guideline_propositions
             else SectionStatus.PASSIVE,
@@ -461,34 +489,61 @@ INTERACTION CONTEXT
         builder.add_staged_events(staged_events)
 
         if tool_insights.missing_data:
-            builder.add_section(f"""
+            builder.add_section(
+                name="fluid-message-generator-missing-data-for-tools",
+                template="""
 MISSING DATA FOR TOOL REQUIRED CALLS:
 -------------------------------------
 The following is a description of missing data that has been deemed necessary
 in order to run tools. The tools would have run, if they only had this data available.
-You must inform the customer about this missing data: ###
-{json.dumps([{
-    "datum_name": d.parameter,
-    **({"description": d.description} if d.description else {}),
-    **({"significance": d.significance} if d.significance else {}),
-    **({"examples": d.examples} if d.examples else {}),
-} for d in tool_insights.missing_data])}
+If it makes sense in the current state of the interaction, you may choose to inform the user about this missing data: ###
+{formatted_missing_data}
 ###
 
-""")
+""",
+                props={
+                    "formatted_missing_data": self._format_missing_data(tool_insights.missing_data),
+                    "missing_data": tool_insights.missing_data,
+                },
+            )
 
         builder.add_section(
-            f"""
+            name="fluid-message-generator-output-format",
+            template="""
 OUTPUT FORMAT
 -----------------
 
 Produce a valid JSON object in the following format: ###
 
-{self._get_output_format(interaction_history, list(chain(ordinary_guideline_propositions, tool_enabled_guideline_propositions)))}"""
+{default_output_format}
+###
+""",
+            props={
+                "default_output_format": self._get_output_format(
+                    interaction_history,
+                    list(
+                        chain(ordinary_guideline_propositions, tool_enabled_guideline_propositions)
+                    ),
+                ),
+                "interaction_history": interaction_history,
+                "guidelines": list(
+                    chain(ordinary_guideline_propositions, tool_enabled_guideline_propositions)
+                ),
+            },
         )
 
-        prompt = builder.build()
-        return prompt
+        return builder
+
+    def _format_missing_data(self, missing_data: Sequence[MissingToolData]) -> str:
+        return "\n".join(
+            f"""
+    {d.parameter}
+    {d.description}
+    {d.significance}
+    {d.examples}
+    """
+            for d in missing_data
+        )
 
     def _get_output_format(
         self, interaction_history: Sequence[Event], guidelines: Sequence[GuidelineProposition]
@@ -593,7 +648,7 @@ Produce a valid JSON object in the following format: ###
 
     async def _generate_response_message(
         self,
-        prompt: str,
+        prompt: PromptBuilder,
         temperature: float,
         final_attempt: bool,
     ) -> tuple[GenerationInfo, Optional[str]]:
@@ -606,7 +661,7 @@ Produce a valid JSON object in the following format: ###
             f"Completion:\n{message_event_response.content.model_dump_json(indent=2)}"
         )
 
-        if not message_event_response.content.produced_reply:
+        if message_event_response.content.produced_reply is False:
             self._logger.debug("Produced no reply")
             return message_event_response.info, None
 

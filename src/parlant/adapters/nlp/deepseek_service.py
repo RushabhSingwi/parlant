@@ -34,6 +34,7 @@ import tiktoken
 
 from parlant.adapters.nlp.common import normalize_json_output
 from parlant.adapters.nlp.hugging_face import JinaAIEmbedder
+from parlant.core.engines.alpha.prompt_builder import PromptBuilder
 from parlant.core.loggers import Logger
 from parlant.core.nlp.policies import policy, retry
 from parlant.core.nlp.tokenization import EstimatingTokenizer
@@ -42,10 +43,9 @@ from parlant.core.nlp.embedding import Embedder
 from parlant.core.nlp.generation import (
     T,
     SchematicGenerator,
-    GenerationInfo,
     SchematicGenerationResult,
-    UsageInfo,
 )
+from parlant.core.nlp.generation_info import GenerationInfo, UsageInfo
 from parlant.core.nlp.moderation import (
     ModerationService,
     NoModeration,
@@ -117,9 +117,12 @@ class DeepSeekSchematicGenerator(SchematicGenerator[T]):
 
     async def _do_generate(
         self,
-        prompt: str,
+        prompt: str | PromptBuilder,
         hints: Mapping[str, Any] = {},
     ) -> SchematicGenerationResult[T]:
+        if isinstance(prompt, PromptBuilder):
+            prompt = prompt.build()
+
         deepseek_api_arguments = {
             k: v for k, v in hints.items() if k in self.supported_deepseek_params
         }

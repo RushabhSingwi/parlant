@@ -29,14 +29,14 @@ import tiktoken
 
 from parlant.adapters.nlp.common import normalize_json_output
 from parlant.adapters.nlp.hugging_face import JinaAIEmbedder
+from parlant.core.engines.alpha.prompt_builder import PromptBuilder
 from parlant.core.nlp.embedding import Embedder
 from parlant.core.nlp.generation import (
     T,
     SchematicGenerator,
-    GenerationInfo,
     SchematicGenerationResult,
-    UsageInfo,
 )
+from parlant.core.nlp.generation_info import GenerationInfo, UsageInfo
 from parlant.core.loggers import Logger
 from parlant.core.nlp.moderation import ModerationService, NoModeration
 from parlant.core.nlp.policies import policy, retry
@@ -82,9 +82,12 @@ class CerebrasSchematicGenerator(SchematicGenerator[T]):
     @override
     async def generate(
         self,
-        prompt: str,
+        prompt: str | PromptBuilder,
         hints: Mapping[str, Any] = {},
     ) -> SchematicGenerationResult[T]:
+        if isinstance(prompt, PromptBuilder):
+            prompt = prompt.build()
+
         cerebras_api_arguments = {k: v for k, v in hints.items() if k in self.supported_hints}
 
         t_start = time.time()
@@ -121,6 +124,7 @@ class CerebrasSchematicGenerator(SchematicGenerator[T]):
 
             return SchematicGenerationResult(
                 content=model_content,
+                prompt=prompt,
                 info=GenerationInfo(
                     schema_name=self.schema.__name__,
                     model=self.id,
